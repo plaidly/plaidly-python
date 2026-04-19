@@ -2,8 +2,26 @@
 
 from __future__ import annotations
 
+import time
 import httpx
 from typing import Any, Optional
+
+
+def _request(http: httpx.Client, method: str, path: str, **kwargs: Any) -> httpx.Response:
+    """Execute an HTTP request with up to 3 attempts on transient failures."""
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = http.request(method, path, **kwargs)
+            if resp.status_code >= 500 and attempt < 2:
+                time.sleep(2 ** attempt * 0.5)
+                continue
+            return resp
+        except (httpx.TimeoutException, httpx.NetworkError) as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(2 ** attempt * 0.5)
+    raise last_exc  # type: ignore[misc]
 
 
 class PlaidlyClient:
@@ -99,7 +117,7 @@ class SessionsAPI:
             payload["metadata"] = metadata
         if idempotency_key is not None:
             payload["idempotency_key"] = idempotency_key
-        resp = self._http.post("/v1/sessions", json=payload)
+        resp = _request(self._http, "POST", "/v1/sessions", json=payload)
         resp.raise_for_status()
         return resp.json()  # type: ignore[no-any-return]
 
@@ -112,7 +130,7 @@ class SessionsAPI:
         Returns:
             Session dict.
         """
-        resp = self._http.get(f"/v1/sessions/{session_id}")
+        resp = _request(self._http, "GET", f"/v1/sessions/{session_id}")
         resp.raise_for_status()
         return resp.json()  # type: ignore[no-any-return]
 
@@ -122,7 +140,7 @@ class SessionsAPI:
         Returns:
             Dict with ``sessions`` list and ``total`` count.
         """
-        resp = self._http.get("/v1/sessions")
+        resp = _request(self._http, "GET", "/v1/sessions")
         resp.raise_for_status()
         return resp.json()  # type: ignore[no-any-return]
 
@@ -136,7 +154,7 @@ class SessionsAPI:
         payload: dict[str, Any] = {}
         if tx_hash is not None:
             payload["tx_hash"] = tx_hash
-        resp = self._http.post(f"/v1/sessions/{session_id}/simulate", json=payload)
+        resp = _request(self._http, "POST", f"/v1/sessions/{session_id}/simulate", json=payload)
         resp.raise_for_status()
 
 
@@ -167,7 +185,7 @@ class MerchantsAPI:
         payload: dict[str, Any] = {"name": name, "email": email, "sandbox": sandbox}
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url
-        resp = self._http.post("/v1/merchants", json=payload)
+        resp = _request(self._http, "POST", "/v1/merchants", json=payload)
         resp.raise_for_status()
         return resp.json()  # type: ignore[no-any-return]
 
@@ -177,7 +195,7 @@ class MerchantsAPI:
         Returns:
             Merchant dict.
         """
-        resp = self._http.get("/v1/me")
+        resp = _request(self._http, "GET", "/v1/me")
         resp.raise_for_status()
         return resp.json()  # type: ignore[no-any-return]
 
@@ -215,7 +233,7 @@ class PayoutsAPI:
             "network": network,
             "address": address,
         }
-        resp = self._http.post("/v1/payouts", json=payload)
+        resp = _request(self._http, "POST", "/v1/payouts", json=payload)
         resp.raise_for_status()
         return resp.json()  # type: ignore[no-any-return]
 
@@ -228,7 +246,7 @@ class PayoutsAPI:
         Returns:
             Payout dict.
         """
-        resp = self._http.get(f"/v1/payouts/{payout_id}")
+        resp = _request(self._http, "GET", f"/v1/payouts/{payout_id}")
         resp.raise_for_status()
         return resp.json()  # type: ignore[no-any-return]
 
@@ -245,6 +263,6 @@ class SandboxAPI:
         Returns:
             List of faucet dicts with ``chain``, ``network``, ``url``, ``description``.
         """
-        resp = self._http.get("/v1/sandbox/faucets")
+        resp = _request(self._http, "GET", "/v1/sandbox/faucets")
         resp.raise_for_status()
         return resp.json()  # type: ignore[no-any-return]
