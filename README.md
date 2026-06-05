@@ -2,12 +2,8 @@
 
 Official Python SDK for the [Plaidly](https://plaidly.io) cryptocurrency payment API.
 
-Types and the low-level HTTP client are auto-generated from the Plaidly
-OpenAPI 3.1 spec with
-[`openapi-python-client`](https://github.com/openapi-generators/openapi-python-client).
-The high-level `PlaidlyClient` and the `verify_webhook_signature` helper
-are hand-written wrappers that add retries, typed errors, and ergonomic
-groupings.
+Typed, dependency-light (`httpx` only), and aligned to the Plaidly v1 API
+contract.
 
 ## Installation
 
@@ -15,82 +11,120 @@ groupings.
 pip install plaidly-python
 ```
 
-## Usage
+## Quickstart
 
 ```python
-from plaidly import (
-    PlaidlyClient,
-    CreatePaymentSessionRequest,
-    PaymentMethod,
-)
 import os
+from plaidly import PlaidlyClient
 
 client = PlaidlyClient(api_key=os.environ["PLAIDLY_API_KEY"])
 
+# Create a payment session
 session = client.payment_sessions.create(
-    CreatePaymentSessionRequest(
-        amount=10.0,
-        expires_in="15m",
-        payment_method=PaymentMethod(
-            method_id=0, chain="solana", token="USDC", network="mainnet",
-        ),
-    )
+    amount=10.00,
+    chain="solana",
+    token="USDC",
+    network="mainnet",          # "mainnet" | "testnet"
+    expires_in="15m",
+    metadata={"order_id": "1234"},
 )
 
-print(session.address)  # Send funds here
+print(session.address)      # deposit address — send funds here
+print(session.payment_url)  # hosted checkout URL for the payer
+print(session.qr_data)      # payment URI for QR encoding
+
+# Poll for completion (public endpoint — also usable on the checkout page)
+session = client.payment_sessions.get(session.session_id)
+if session.is_paid:         # True when status is "completed" or "confirmed"
+    print("Paid!")
 ```
 
-## Context Manager
+Every call returns a typed dataclass (`PaymentSession`, `Merchant`,
+`PaymentMethodInfo`, `Rate`) — autocompletion and type checking work out of
+the box. Use the context manager to close the connection pool automatically:
 
 ```python
 with PlaidlyClient(api_key=os.environ["PLAIDLY_API_KEY"]) as client:
-    merchant = client.merchants.me()
+    me = client.merchants.me()
+    print(me.name)
 ```
 
-## Webhook Verification
+## Endpoints
 
 ```python
+# Payment sessions
+client.payment_sessions.create(amount, chain, token, network="mainnet",
+                               expires_in="15m", method_id=0, metadata=None)
+client.payment_sessions.get(session_id)
+client.payment_sessions.create_demo(chain=None, token=None, network=None, amount=None)
+client.payment_sessions.simulate(session_id)   # demo/sandbox only — instant complete
+
+# Discovery (public)
+client.payment_methods()                        # list[PaymentMethodInfo]
+client.rates(symbols=["ETH", "SOL"])            # list[Rate]; stablecoins fixed at 1.0
+client.faucets()                                # dict[str, str], chain:network -> URL
+
+# Merchants
+client.merchants.register(name, webhook_url=None)   # returns api_key + webhook_secret
+client.merchants.me()
+```
+
+## Demo flow (no API key needed for the demo session)
+
+```python
+client = PlaidlyClient(api_key="demo")
+demo = client.payment_sessions.create_demo(chain="ethereum", token="USDC", amount=5.0)
+done = client.payment_sessions.simulate(demo.session_id)
+assert done.is_paid
+```
+
+## Error handling
+
+Non-2xx responses raise `PlaidlyError` with the parsed API error body. Transient
+failures (network errors, 5xx) are retried up to 3 times with exponential
+backoff before raising.
+
+```python
+from plaidly import PlaidlyError
+
+try:
+    client.payment_sessions.get("does-not-exist")
+except PlaidlyError as e:
+    print(e.status)   # HTTP status code
+    print(e.code)     # application error code (int) or None
+    print(e.message)  # error message
+```
+
+## Webhook verification
+
+Plaidly signs every webhook with the `X-Plaidly-Signature` header in the form
+`t=<unix>,v1=<hex>`, where the hex value is
+`HMAC-SHA256(webhook_secret, "<t>.<raw_body>")`. Verification is constant-time
+and enforces a 5-minute timestamp tolerance by default.
+
+```python
+import os
 from plaidly import verify_webhook_signature
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     valid = verify_webhook_signature(
-        request.get_data(),
-        request.headers.get("X-Plaidly-Signature"),
-        os.environ["PLAIDLY_WEBHOOK_SECRET"],
+        payload=request.get_data(),                      # raw, unmodified body
+        signature=request.headers["X-Plaidly-Signature"],
+        secret=os.environ["PLAIDLY_WEBHOOK_SECRET"],     # from merchant registration
     )
     if not valid:
-        return "Invalid signature", 401
+        return "invalid signature", 403
+    # event = request.get_json()  ->  {"event_type", "session_id", "status", ...}
     return "", 204
 ```
 
-## Escape hatch — generated client
-
-For endpoints not yet exposed on `PlaidlyClient`, use the raw
-`AuthenticatedClient` from [openapi-python-client]:
-
-```python
-from plaidly.generated.api.wallets import list_wallets
-
-client = PlaidlyClient(api_key="...").raw
-wallets = list_wallets.sync(client=client)
-```
-
-## Regenerating from the spec
-
-The committed copy of the Plaidly spec lives at `spec/openapi.yaml`.
+## Development
 
 ```bash
-make generate                                   # default
-make generate SPEC=path/to/openapi.yaml
-make generate OAPI_PY_CLIENT_VERSION=0.24.3
+pip install -e ".[dev]"
+pytest
 ```
-
-Generated output: `src/plaidly/generated/`. Do not edit by hand.
-
-Pinned versions:
-
-- `openapi-python-client==0.24.3`
 
 ## API Reference
 
