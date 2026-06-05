@@ -3,43 +3,73 @@
 from __future__ import annotations
 
 import time
-import httpx
 from typing import Any, Optional
+
+import httpx
+
+from .errors import PlaidlyError
+from .models import (
+    Merchant,
+    PaymentMethod,
+    PaymentMethodInfo,
+    PaymentSession,
+    Rate,
+)
+
+_RETRY_STATUS = {500, 502, 503, 504}
 
 
 def _request(http: httpx.Client, method: str, path: str, **kwargs: Any) -> httpx.Response:
-    """Execute an HTTP request with up to 3 attempts on transient failures."""
-    last_exc: Exception | None = None
+    """Execute an HTTP request with up to 3 attempts on transient failures.
+
+    Retries on connection/timeout errors and 5xx responses with exponential
+    backoff. The final response is returned regardless of status; callers map
+    non-2xx responses to :class:`PlaidlyError` via :func:`_unwrap`.
+    """
+    last_exc: Optional[Exception] = None
     for attempt in range(3):
         try:
             resp = http.request(method, path, **kwargs)
-            if resp.status_code >= 500 and attempt < 2:
-                time.sleep(2 ** attempt * 0.5)
+            if resp.status_code in _RETRY_STATUS and attempt < 2:
+                time.sleep(2**attempt * 0.5)
                 continue
             return resp
         except (httpx.TimeoutException, httpx.NetworkError) as e:
             last_exc = e
             if attempt < 2:
-                time.sleep(2 ** attempt * 0.5)
-    raise last_exc  # type: ignore[misc]
+                time.sleep(2**attempt * 0.5)
+    raise PlaidlyError(
+        f"network error after retries: {last_exc}",
+        status=0,
+    )
+
+
+def _unwrap(resp: httpx.Response) -> Any:
+    """Raise :class:`PlaidlyError` on non-2xx, else return the decoded JSON body."""
+    if resp.status_code >= 400:
+        raise PlaidlyError.from_response(resp)
+    if not resp.content:
+        return None
+    return resp.json()
 
 
 class PlaidlyClient:
     """Synchronous Plaidly API client.
 
     Args:
-        api_key: Your Plaidly API key (``X-API-Key`` header).
+        api_key: Your Plaidly API key, sent as the ``X-API-Key`` header.
         base_url: Override the default API base URL.
         timeout: HTTP request timeout in seconds (default: 30).
 
     Example::
 
         client = PlaidlyClient(api_key="pk_live_...")
-        session = client.sessions.create(
-            amount="100.00",
-            currency="USDC",
+        session = client.payment_sessions.create(
+            amount=100.00,
             chain="solana",
+            token="USDC",
         )
+        print(session.address)
     """
 
     def __init__(
@@ -54,15 +84,37 @@ class PlaidlyClient:
             base_url=base_url.rstrip("/"),
             headers={
                 "X-API-Key": api_key,
+                "Authorization": f"Bearer {api_key}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
             },
             timeout=timeout,
         )
-        self.sessions = SessionsAPI(self._http)
+        self.payment_sessions = PaymentSessionsAPI(self._http)
         self.merchants = MerchantsAPI(self._http)
-        self.payouts = PayoutsAPI(self._http)
-        self.sandbox = SandboxAPI(self._http)
+
+    def payment_methods(self) -> list[PaymentMethodInfo]:
+        """List enabled payment methods (chain/token combinations)."""
+        body = _unwrap(_request(self._http, "GET", "/v1/payment_methods"))
+        return [PaymentMethodInfo.from_dict(m) for m in (body or [])]
+
+    def rates(self, symbols: Optional[list[str]] = None) -> list[Rate]:
+        """Get USD spot rates for supported assets.
+
+        Args:
+            symbols: Optional list of symbols (e.g. ``["ETH", "SOL"]``).
+                Omit for all rates. Stablecoins are fixed at ``1.0``.
+        """
+        params: dict[str, str] = {}
+        if symbols:
+            params["symbols"] = ",".join(symbols)
+        body = _unwrap(_request(self._http, "GET", "/v1/rates", params=params))
+        return [Rate.from_dict(r) for r in (body or [])]
+
+    def faucets(self) -> dict[str, str]:
+        """List testnet faucet URLs keyed by ``chain:network``."""
+        body = _unwrap(_request(self._http, "GET", "/v1/sandbox/faucets"))
+        return dict(body or {})
 
     def close(self) -> None:
         """Close the underlying HTTP connection pool."""
@@ -75,7 +127,7 @@ class PlaidlyClient:
         self.close()
 
 
-class SessionsAPI:
+class PaymentSessionsAPI:
     """Operations on payment sessions."""
 
     def __init__(self, http: httpx.Client) -> None:
@@ -83,79 +135,84 @@ class SessionsAPI:
 
     def create(
         self,
-        amount: str,
-        currency: str,
+        amount: float,
         chain: str,
+        token: str,
         network: str = "mainnet",
-        callback_url: Optional[str] = None,
-        metadata: Optional[dict[str, str]] = None,
-        idempotency_key: Optional[str] = None,
-    ) -> dict[str, Any]:
+        expires_in: str = "15m",
+        method_id: int = 0,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> PaymentSession:
         """Create a new payment session.
 
         Args:
-            amount: Payment amount as a decimal string (e.g. ``"100.00"``).
-            currency: Token symbol (e.g. ``"USDC"``, ``"ETH"``).
+            amount: Expected amount to be paid.
             chain: Blockchain name (e.g. ``"solana"``, ``"ethereum"``).
-            network: Network name (default: ``"mainnet"``).
-            callback_url: URL that Plaidly will POST webhook events to.
+            token: Token symbol (e.g. ``"USDC"``, ``"ETH"``).
+            network: Network name, ``"mainnet"`` or ``"testnet"``.
+            expires_in: Duration until the session expires (e.g. ``"15m"``).
+            method_id: ``0`` = crypto, ``1`` = fiat.
             metadata: Arbitrary key-value pairs attached to the session.
-            idempotency_key: Optional idempotency key for safe retries.
-
-        Returns:
-            Session dict.
         """
         payload: dict[str, Any] = {
             "amount": amount,
-            "currency": currency,
-            "chain": chain,
-            "network": network,
+            "expires_in": expires_in,
+            "paymentMethod": PaymentMethod(
+                method_id=method_id, chain=chain, token=token, network=network
+            ).to_dict(),
         }
-        if callback_url is not None:
-            payload["callback_url"] = callback_url
         if metadata is not None:
             payload["metadata"] = metadata
-        if idempotency_key is not None:
-            payload["idempotency_key"] = idempotency_key
-        resp = _request(self._http, "POST", "/v1/sessions", json=payload)
-        resp.raise_for_status()
-        return resp.json()  # type: ignore[no-any-return]
+        body = _unwrap(
+            _request(self._http, "POST", "/v1/payment_sessions", json=payload)
+        )
+        return PaymentSession.from_dict(body)
 
-    def get(self, session_id: str) -> dict[str, Any]:
-        """Fetch a session by ID.
+    def get(self, session_id: str) -> PaymentSession:
+        """Fetch a payment session by ID (public — used for checkout polling)."""
+        body = _unwrap(
+            _request(self._http, "GET", f"/v1/payment_sessions/{session_id}")
+        )
+        return PaymentSession.from_dict(body)
 
-        Args:
-            session_id: Session identifier.
+    def create_demo(
+        self,
+        chain: Optional[str] = None,
+        token: Optional[str] = None,
+        network: Optional[str] = None,
+        amount: Optional[float] = None,
+    ) -> PaymentSession:
+        """Create a public demo payment session.
 
-        Returns:
-            Session dict.
-        """
-        resp = _request(self._http, "GET", f"/v1/sessions/{session_id}")
-        resp.raise_for_status()
-        return resp.json()  # type: ignore[no-any-return]
-
-    def list(self) -> dict[str, Any]:
-        """List all sessions for the authenticated merchant.
-
-        Returns:
-            Dict with ``sessions`` list and ``total`` count.
-        """
-        resp = _request(self._http, "GET", "/v1/sessions")
-        resp.raise_for_status()
-        return resp.json()  # type: ignore[no-any-return]
-
-    def simulate(self, session_id: str, tx_hash: Optional[str] = None) -> None:
-        """Simulate a payment for a sandbox session.
-
-        Args:
-            session_id: Session identifier.
-            tx_hash: Optional mock transaction hash.
+        All arguments are optional; the API picks sensible defaults when omitted.
         """
         payload: dict[str, Any] = {}
-        if tx_hash is not None:
-            payload["tx_hash"] = tx_hash
-        resp = _request(self._http, "POST", f"/v1/sessions/{session_id}/simulate", json=payload)
-        resp.raise_for_status()
+        if chain is not None:
+            payload["chain"] = chain
+        if token is not None:
+            payload["token"] = token
+        if network is not None:
+            payload["network"] = network
+        if amount is not None:
+            payload["amount"] = amount
+        body = _unwrap(
+            _request(self._http, "POST", "/v1/payment_sessions/demo", json=payload)
+        )
+        return PaymentSession.from_dict(body)
+
+    def simulate(self, session_id: str) -> PaymentSession:
+        """Instantly complete a demo/sandbox session's payment.
+
+        Only valid for demo or sandbox sessions in a pending state.
+        """
+        body = _unwrap(
+            _request(
+                self._http,
+                "POST",
+                f"/v1/payment_sessions/{session_id}/simulate",
+            )
+        )
+        return PaymentSession.from_dict(body)
 
 
 class MerchantsAPI:
@@ -167,102 +224,24 @@ class MerchantsAPI:
     def register(
         self,
         name: str,
-        email: str,
         webhook_url: Optional[str] = None,
-        sandbox: bool = False,
-    ) -> dict[str, Any]:
-        """Register a new merchant.
+    ) -> Merchant:
+        """Register a new merchant and receive an API key.
 
         Args:
             name: Merchant display name.
-            email: Contact email address.
-            webhook_url: URL to receive webhook events.
-            sandbox: When ``True``, creates a sandbox merchant.
+            webhook_url: Optional URL to receive webhook events.
 
         Returns:
-            Merchant dict including the generated API key.
+            The created merchant, including ``api_key`` and ``webhook_secret``.
         """
-        payload: dict[str, Any] = {"name": name, "email": email, "sandbox": sandbox}
+        payload: dict[str, Any] = {"name": name}
         if webhook_url is not None:
             payload["webhook_url"] = webhook_url
-        resp = _request(self._http, "POST", "/v1/merchants", json=payload)
-        resp.raise_for_status()
-        return resp.json()  # type: ignore[no-any-return]
+        body = _unwrap(_request(self._http, "POST", "/v1/merchants", json=payload))
+        return Merchant.from_dict(body)
 
-    def me(self) -> dict[str, Any]:
-        """Return the authenticated merchant's profile.
-
-        Returns:
-            Merchant dict.
-        """
-        resp = _request(self._http, "GET", "/v1/me")
-        resp.raise_for_status()
-        return resp.json()  # type: ignore[no-any-return]
-
-
-class PayoutsAPI:
-    """Operations on payouts."""
-
-    def __init__(self, http: httpx.Client) -> None:
-        self._http = http
-
-    def create(
-        self,
-        amount: str,
-        currency: str,
-        chain: str,
-        address: str,
-        network: str = "mainnet",
-    ) -> dict[str, Any]:
-        """Request a payout.
-
-        Args:
-            amount: Amount to pay out as a decimal string.
-            currency: Token symbol.
-            chain: Blockchain name.
-            address: Destination wallet address.
-            network: Network name (default: ``"mainnet"``).
-
-        Returns:
-            Payout dict.
-        """
-        payload: dict[str, Any] = {
-            "amount": amount,
-            "currency": currency,
-            "chain": chain,
-            "network": network,
-            "address": address,
-        }
-        resp = _request(self._http, "POST", "/v1/payouts", json=payload)
-        resp.raise_for_status()
-        return resp.json()  # type: ignore[no-any-return]
-
-    def get(self, payout_id: str) -> dict[str, Any]:
-        """Fetch a payout by ID.
-
-        Args:
-            payout_id: Payout identifier.
-
-        Returns:
-            Payout dict.
-        """
-        resp = _request(self._http, "GET", f"/v1/payouts/{payout_id}")
-        resp.raise_for_status()
-        return resp.json()  # type: ignore[no-any-return]
-
-
-class SandboxAPI:
-    """Sandbox-only helpers."""
-
-    def __init__(self, http: httpx.Client) -> None:
-        self._http = http
-
-    def faucets(self) -> list[dict[str, Any]]:
-        """Return available testnet faucets.
-
-        Returns:
-            List of faucet dicts with ``chain``, ``network``, ``url``, ``description``.
-        """
-        resp = _request(self._http, "GET", "/v1/sandbox/faucets")
-        resp.raise_for_status()
-        return resp.json()  # type: ignore[no-any-return]
+    def me(self) -> Merchant:
+        """Return the authenticated merchant's profile."""
+        body = _unwrap(_request(self._http, "GET", "/v1/me"))
+        return Merchant.from_dict(body)
