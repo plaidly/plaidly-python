@@ -1,4 +1,4 @@
-"""Plaidly Python SDK — official client for the Plaidly crypto payment API.
+"""Plaidly Python SDK — official client for the Plaidly crypto payment API."""
 
 from .client import PlaidlyClient
 from .errors import PlaidlyError

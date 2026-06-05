@@ -1,10 +1,4 @@
-"""High-level Plaidly API client.
-
-This module wraps the auto-generated low-level client in
-:mod:`plaidly.generated` with retries, typed error handling, and a
-friendly facade. Types come straight from the OpenAPI 3.1 spec — regenerate
-with ``make generate``.
-"""
+"""Plaidly API client."""
 
 from __future__ import annotations
 
@@ -65,7 +59,7 @@ class PlaidlyClient:
     Args:
         api_key: Your Plaidly API key, sent as the ``X-API-Key`` header.
         base_url: Override the default API base URL.
-        timeout: HTTP request timeout in seconds (default 30).
+        timeout: HTTP request timeout in seconds (default: 30).
 
     Example::
 
@@ -86,7 +80,7 @@ class PlaidlyClient:
     ) -> None:
         if not api_key:
             raise ValueError("api_key is required")
-        self._generated = AuthenticatedClient(
+        self._http = httpx.Client(
             base_url=base_url.rstrip("/"),
             headers={
                 "X-API-Key": api_key,
@@ -124,7 +118,7 @@ class PlaidlyClient:
 
     def close(self) -> None:
         """Close the underlying HTTP connection pool."""
-        self._generated.get_httpx_client().close()
+        self._http.close()
 
     def __enter__(self) -> "PlaidlyClient":
         return self
@@ -136,11 +130,8 @@ class PlaidlyClient:
 class PaymentSessionsAPI:
     """Operations on payment sessions."""
 
-    def register(self, body: RegisterMerchantRequest) -> Merchant:
-        resp = _call_with_retries(
-            lambda: register_merchant.sync_detailed(client=self._client, body=body)
-        )
-        return _unwrap(resp)
+    def __init__(self, http: httpx.Client) -> None:
+        self._http = http
 
     def create(
         self,
@@ -224,15 +215,11 @@ class PaymentSessionsAPI:
         return PaymentSession.from_dict(body)
 
 
-class _PayoutsAPI:
-    def __init__(self, client: AuthenticatedClient) -> None:
-        self._client = client
+class MerchantsAPI:
+    """Operations on merchants."""
 
-    def request(self, body: RequestPayoutRequest) -> Payout:
-        resp = _call_with_retries(
-            lambda: request_payout.sync_detailed(client=self._client, body=body)
-        )
-        return _unwrap(resp)
+    def __init__(self, http: httpx.Client) -> None:
+        self._http = http
 
     def register(
         self,
